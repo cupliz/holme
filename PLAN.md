@@ -13,10 +13,18 @@ Nav link in header switches between them so the difference is immediately appare
 ---
 
 ## Stack
-- Next.js 15 (App Router) + TypeScript + Tailwind CSS
-- Fuse.js (both routes — keyword baseline + instant fallback on /ai-search)
-- OpenAI `text-embedding-3-small` via OpenRouter (/ai-search only)
-- No database — data fetched at build time, vectors loaded client-side
+- Next.js 16 (App Router) + TypeScript + Tailwind CSS
+- Fuse.js (/search — keyword)
+- OpenAI `text-embedding-3-small` (1536-dim) for embeddings (/ai-search only)
+- Qdrant vector DB (`homegoods` collection) for semantic retrieval
+- No build-time vector files — products embedded once into Qdrant via a script;
+  queries embedded server-side per request
+
+> **Correction to the original plan:** OpenRouter does **not** expose an
+> `/embeddings` endpoint, so embeddings come straight from the OpenAI API
+> (`OPENAI_API_KEY`). Vectors live in **Qdrant** (`http://keiko.otka.ai:6336`,
+> collection `homegoods`), not a client-side `embeddings.json`. Cosine ranking
+> happens in Qdrant, not in the browser.
 
 ---
 
@@ -61,41 +69,43 @@ type Product = {
 ```
 /
   scripts/
-    precompute-embeddings.ts     — one-time: fetch items.json, embed all, write public/embeddings.json
+    ingest-qdrant.ts             — one-time: fetch items.json, embed all (OpenAI), upsert into Qdrant
 
   lib/
-    products.ts                  — normalize(), toTitleCase(), Product type
-    keyword-search.ts            — fuseSearch(), filterProducts(), sortProducts()
-    semantic-search.ts           — cosineSimilarity(), semanticSearch(), mergeResults()
+    products.ts                  — normalize(), toTitleCase(), Product type, fetchProducts()
+    keyword-search.ts            — Fuse index + applyFilters()/applySort() (exported, shared)
+    embed.ts                     — embedBatch()/embedOne() via OpenAI (shared ingest + query)
+    qdrant.ts                    — Qdrant HTTP client: recreateCollection, upsertPoints, searchVectors
+    search-server.ts             — keyword: cached products + Fuse, runSearch()
+    ai-search-server.ts          — semantic: cached products + id map, runAiSearch()
 
   app/
-    layout.tsx                   — shared shell with header nav (/search ↔ /ai-search)
+    layout.tsx                   — shared shell, renders <NavHeader/>
     page.tsx                     — redirect to /search
 
     search/
-      page.tsx                   — server component: fetch products → pass to client
-      SearchClient.tsx           — 'use client': Fuse.js search + filters + grid
+      page.tsx                   — server: initial results → SearchClient
+      SearchClient.tsx           — 'use client': keyword search via /api/search
 
     ai-search/
-      page.tsx                   — server component: fetch products → pass to client
-      AiSearchClient.tsx         — 'use client': hybrid search, loads embeddings, calls /api/embed
-      loading.tsx                — skeleton state while embeddings.json loads
+      page.tsx                   — server: initial catalog → AiSearchClient
+      AiSearchClient.tsx         — 'use client': semantic search via /api/ai-search
 
     api/
-      embed/
-        route.ts                 — POST { query } → vector via OpenRouter (server-side, key hidden)
+      search/route.ts            — GET → runSearch (keyword)
+      ai-search/route.ts         — GET → runAiSearch (embed query + Qdrant)
 
   components/
-    SearchBar.tsx                — shared input with debounce
     FilterBar.tsx                — shared category pills, inStock toggle, price range, min rating
     ProductGrid.tsx              — shared results grid with sort controls
     ProductCard.tsx              — shared card (image, title, brand, price, rating, badges)
     RatingStars.tsx              — shared star display
-    NavHeader.tsx                — logo + /search vs /ai-search toggle tabs
+    NavHeader.tsx                — 'use client': logo + /search vs /ai-search active tabs
 
-  public/
-    embeddings.json              — precomputed vectors (committed, served statically)
+  .env.example                   — OPENAI_API_KEY, QDRANT_URL, QDRANT_COLLECTION
 ```
+
+Vectors live in Qdrant (`homegoods`), not a committed file.
 
 ---
 
@@ -118,31 +128,29 @@ type Product = {
 
 ### Embedding strategy
 
-**Precompute (run once, output committed)**
-- Script: `scripts/precompute-embeddings.ts`
-- Text blob: `title + brand + category + tags.join(' ') + description`
-- Model: `openai/text-embedding-3-small` via OpenRouter
-  - Base URL: `https://openrouter.ai/api/v1`
-  - API key stored in `.env.local` as `OPENROUTER_API_KEY`
-- Output: `public/embeddings.json` → `{ id: number, vector: number[] }[]`
-- Size: ~4000 × 1536 floats ≈ 24MB raw, ~6MB gzip
+**Ingest (run once — `scripts/ingest-qdrant.ts`, `bun run ingest`)**
+- Fetch the 4,000 items, normalize, build one text blob per product:
+  `title. brand. category. tags. description`
+- Embed in batches with OpenAI `text-embedding-3-small` (1536-dim)
+- Recreate the Qdrant `homegoods` collection (cosine, 1536) and upsert each
+  product as a point whose **id == product id** (so a hit maps straight back
+  to the in-memory Product)
+- Re-runnable: recreates the collection and re-upserts every time
 
-**Query-time**
-- POST query to `/api/embed` → OpenRouter returns query vector
-- `Float32Array` cosine similarity across all 4000 vectors in-browser (~5ms)
-- Top-N IDs ranked by score, looked up from product map
-
-**Hybrid merge**
-- Fuse.js keyword results show instantly while embed call is in flight
-- On embed response: semantic top 10 ranked first, keyword-only appended below divider
-- Exact title match always pinned to top regardless of cosine score
+**Query-time (`/api/ai-search` → `lib/ai-search-server.ts`)**
+- Product list fetched once per server instance and cached (id → Product map)
+- Per request: embed the query string (one sentence) → Qdrant vector search
+  (`TOP_K=120`) → map returned ids back to Products → apply shared
+  filters/sort. Empty query = full catalog, no embedding call.
+- Whole query is embedded as a **phrase/sentence**, matched by meaning — not
+  per character. The 600ms debounce waits for the phrase to settle first.
 
 ### UX flow
-1. User types → Fuse.js keyword results appear instantly (0ms)
-2. 150ms debounce → POST `/api/embed` (~100ms round-trip)
-3. Cosine ranking runs in-browser → grid re-ranks smoothly (no layout jump)
-4. Badge: "AI" pill on semantic matches, "Keyword" on fallback-only results
-5. Label: "24 semantic matches for 'cozy bedroom'"
+1. User types a phrase ("cozy furniture", "modern kitchen table")
+2. 600ms debounce → GET `/api/ai-search?q=…` (embed + Qdrant, server-side)
+3. Grid dims (`pending`) during the round-trip, then re-ranks by semantic score
+4. Label: "24 semantic matches for 'cozy furniture'"
+5. Errors (e.g. missing key) surface in a red banner, grid keeps last results
 
 ### Why it feels different from /search
 - "cozy bedroom" → Textiles, Lighting, Decor by intent, zero keyword overlap
@@ -175,14 +183,13 @@ Bath, Decor, Furniture, Kitchen, Lighting, Office, Outdoor, Storage, Textiles, W
 
 ---
 
-## Build Order
-1. `scripts/precompute-embeddings.ts` → run → commit `public/embeddings.json`
-2. `lib/products.ts` — normalizer + types
-3. `lib/keyword-search.ts` — Fuse.js + filter + sort
-4. `components/` — ProductCard, ProductGrid, SearchBar, FilterBar, RatingStars, NavHeader
-5. `app/search/` — server page + SearchClient
-6. `lib/semantic-search.ts` — cosine + merge
-7. `app/api/embed/route.ts` — embed proxy
-8. `app/ai-search/` — server page + AiSearchClient
-9. `app/layout.tsx` — shared shell
-10. Polish: transitions, empty states, loading skeletons, mobile layout
+## Running it
+1. `cp .env.example .env.local` and set `OPENAI_API_KEY` (Qdrant defaults are
+   already correct for `keiko.otka.ai`).
+2. `bun run ingest` — embeds 4,000 products into the Qdrant `homegoods`
+   collection (recreates it). One-time; re-run to refresh.
+3. `bun run dev` — `/search` (keyword) and `/ai-search` (semantic) both live.
+
+Without step 2 the collection exists but is empty, so `/ai-search` returns no
+semantic matches. Without `OPENAI_API_KEY`, `/api/ai-search` returns a 500 that
+the client surfaces as a red banner.

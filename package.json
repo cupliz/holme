@@ -6,7 +6,8 @@
     "dev": "next dev --port 3005",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "ingest": "bun run scripts/ingest-qdrant.ts"
   },
   "dependencies": {
     "fuse.js": "^7.4.2",

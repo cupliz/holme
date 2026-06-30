@@ -49,8 +49,10 @@ export function normalizeProduct(raw: any): Product {
 
 export async function fetchProducts(): Promise<Product[]> {
   const res = await fetch('https://media.downshift.app/hiring/founding-engineer/items.json', {
+    // `next` is a Next.js fetch extension (ignored by plain Node, e.g. the
+    // ingest script); cast so this file typechecks under both runtimes.
     next: { revalidate: 86400 },
-  })
+  } as RequestInit & { next: { revalidate: number } })
   const raw = await res.json()
   return raw.map(normalizeProduct)
 }

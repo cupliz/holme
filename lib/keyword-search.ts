@@ -28,7 +28,7 @@ export function buildIndex(products: Product[]) {
   })
 }
 
-function applyFilters(products: Product[], filters: Filters): Product[] {
+export function applyFilters(products: Product[], filters: Filters): Product[] {
   return products.filter((p) => {
     if (filters.category && p.category !== filters.category) return false
     if (filters.inStock && !p.inStock) return false
@@ -39,7 +39,7 @@ function applyFilters(products: Product[], filters: Filters): Product[] {
   })
 }
 
-function applySort(products: Product[], sort: SortOption): Product[] {
+export function applySort(products: Product[], sort: SortOption): Product[] {
   const arr = [...products]
   switch (sort) {
     case 'price-asc':
